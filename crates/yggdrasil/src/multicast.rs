@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use blake2::Blake2b512;
 use getifaddrs::{self, InterfaceFlags};
-use regex::Regex;
+use glob_match::glob_match;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{watch, Mutex};
@@ -155,15 +155,8 @@ impl Multicast {
             return Err("no multicast interfaces enabled".to_string());
         }
 
-        // Compile regex patterns
-        let patterns: Vec<(Regex, MulticastInterfaceConfig)> = config
-            .iter()
-            .map(|c| {
-                let re = Regex::new(&c.regex)
-                    .map_err(|e| format!("invalid regex '{}': {}", c.regex, e));
-                re.map(|r| (r, c.clone()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // Collect glob patterns
+        let patterns: Vec<MulticastInterfaceConfig> = config.clone();
 
         // Create UDP6 socket for multicast
         let socket = create_multicast_socket()
@@ -276,7 +269,7 @@ fn interface_display_name(entry: &getifaddrs::Interface) -> String {
 
 /// Enumerate system interfaces and match against configured patterns.
 /// Returns map of display_name -> InterfaceState.
-fn discover_interfaces(core: &Core, patterns: &[(Regex, MulticastInterfaceConfig)]) -> HashMap<String, InterfaceState> {
+fn discover_interfaces(core: &Core, patterns: &[MulticastInterfaceConfig]) -> HashMap<String, InterfaceState> {
     let mut result = HashMap::new();
 
     let entries = match getifaddrs::getifaddrs() {
@@ -331,11 +324,11 @@ fn discover_interfaces(core: &Core, patterns: &[(Regex, MulticastInterfaceConfig
         }
 
         // Match against configured patterns (first match wins)
-        for (re, cfg) in patterns {
+        for cfg in patterns {
             if !cfg.beacon && !cfg.listen {
                 continue;
             }
-            if !re.is_match(name) {
+            if !glob_match(&cfg.regex, name) {
                 continue;
             }
 
@@ -366,7 +359,7 @@ fn discover_interfaces(core: &Core, patterns: &[(Regex, MulticastInterfaceConfig
 /// Applies the same regex pattern matching as `discover_interfaces`.
 fn discover_from_external(
     core: &Core,
-    patterns: &[(Regex, MulticastInterfaceConfig)],
+    patterns: &[MulticastInterfaceConfig],
     external: &[NetworkInterface],
 ) -> HashMap<String, InterfaceState> {
     let mut result = HashMap::new();
@@ -378,11 +371,11 @@ fn discover_from_external(
         }
 
         // Match against configured patterns (first match wins)
-        for (re, cfg) in patterns {
+        for cfg in patterns {
             if !cfg.beacon && !cfg.listen {
                 continue;
             }
-            if !re.is_match(&iface.name) {
+            if !glob_match(&cfg.regex, &iface.name) {
                 continue;
             }
 
@@ -417,7 +410,7 @@ async fn monitor_and_announce_loop(
     interfaces: Arc<Mutex<HashMap<String, InterfaceState>>>,
     listeners: Arc<Mutex<HashMap<String, ListenerInfo>>>,
     udp: Arc<UdpSocket>,
-    patterns: Vec<(Regex, MulticastInterfaceConfig)>,
+    patterns: Vec<MulticastInterfaceConfig>,
     external_rx: Option<watch::Receiver<Vec<NetworkInterface>>>,
 ) {
     let dest = SocketAddrV6::new(MULTICAST_GROUP, MULTICAST_PORT, 0, 0);

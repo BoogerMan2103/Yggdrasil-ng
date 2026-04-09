@@ -25,7 +25,7 @@ pub struct MulticastInterfaceConfig {
 }
 
 fn default_multicast_regex() -> String {
-    ".*".to_string()
+    "*".to_string()
 }
 
 fn default_true() -> bool {
@@ -34,7 +34,7 @@ fn default_true() -> bool {
 
 fn default_multicast_interfaces() -> Vec<MulticastInterfaceConfig> {
     vec![MulticastInterfaceConfig {
-        regex: ".*".to_string(),
+        regex: "*".to_string(),
         beacon: true,
         listen: true,
         port: 0,

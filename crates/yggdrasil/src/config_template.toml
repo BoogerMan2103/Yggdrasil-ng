@@ -45,14 +45,14 @@ if_mtu = 65535
 # allowed_public_keys = []
 
 # Multicast peer discovery on local network.
-# Each entry matches network interfaces by regex pattern.
+# Each entry matches network interfaces by glob pattern.
 # beacon: advertise this node on matching interfaces
 # listen: accept peer discoveries on matching interfaces
 # port: TLS listener port (0 = auto-assign)
 # priority: connection priority (0-255)
 # password: authentication password (must match on both sides)
 [[multicast_interfaces]]
-regex = ".*"
+regex = "*"
 beacon = true
 listen = true
 # port = 0
