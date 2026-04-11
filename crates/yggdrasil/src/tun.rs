@@ -1,6 +1,6 @@
-// TUN is not supported on Android (handled at the OS/framework level).
-// This module only compiles for non-Android targets.
-#![cfg(not(target_os = "android"))]
+// TUN support is behind the "tun" feature (enabled by default).
+// Disable it with --no-default-features for library/VpnService builds.
+#![cfg(feature = "tun")]
 
 use std::net::Ipv6Addr;
 use std::sync::Arc;

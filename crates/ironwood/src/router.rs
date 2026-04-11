@@ -1259,7 +1259,8 @@ impl Router {
 
     /// Handle incoming lookup from a peer.
     pub fn handle_lookup(&mut self, peer_key: &PublicKey, lookup: &wire::PathLookup) -> Vec<RouterAction> {
-        tracing::debug!("Received lookup from {:?} for dest {:?} (source={:?})", hex::encode(&peer_key[..8]), hex::encode(&lookup.dest[..8]), hex::encode(&lookup.source[..8]));
+        tracing::debug!("Received lookup from {:?} for dest {:?} (source={:?})",
+            hex::encode(&peer_key[..8]), hex::encode(&lookup.dest[..8]), hex::encode(&lookup.source[..8]));
         if !self.blooms.is_on_tree(peer_key) {
             tracing::debug!("Dropping lookup from {:?}: peer not on tree", hex::encode(&peer_key[..8]));
             return Vec::new();
@@ -1303,9 +1304,7 @@ impl Router {
             return actions;
         }
 
-        let xformed_source =
-            self.blooms
-                .x_key(&notify.source, &self.bloom_transform);
+        let xformed_source = self.blooms.x_key(&notify.source, &self.bloom_transform);
 
         let (accepted, traffic) = self.pathfinder.accept_notify(
             notify.source,

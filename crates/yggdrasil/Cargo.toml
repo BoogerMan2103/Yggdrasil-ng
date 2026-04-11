@@ -39,12 +39,14 @@ socket2 = "0.6.3"
 getifaddrs = "0.6"
 
 [features]
-default = ["ctl"]
+default = ["ctl", "tun"]
 ctl = []
+tun = ["dep:tun-rs"]
 
-# tun-rs is not available on Android; TUN is handled at the OS/framework level there.
-[target.'cfg(not(target_os = "android"))'.dependencies]
-tun-rs = { version = "2.8", features = ["async_tokio"] }
+[dependencies.tun-rs]
+version = "2.8"
+features = ["async_tokio"]
+optional = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.0"

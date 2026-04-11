@@ -9,6 +9,6 @@ pub mod links;
 pub mod multicast;
 pub mod proto;
 pub mod tls_support;
-#[cfg(not(target_os = "android"))]
+#[cfg(feature = "tun")]
 pub mod tun;
 pub mod version;

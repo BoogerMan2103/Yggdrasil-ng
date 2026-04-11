@@ -10,6 +10,7 @@ use yggdrasil::config::Config;
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
 
+#[cfg(feature = "tun")]
 use yggdrasil::tun::TunAdapter;
 
 #[cfg(windows)]
@@ -255,6 +256,7 @@ async fn run_node(
     core.set_path_notify(rwc.clone());
 
     // Create TUN adapter
+    #[cfg(feature = "tun")]
     let _tun = if config.if_name != "none" {
         let addr_str = core.address().to_string();
         let subnet_str = core.subnet().to_string();
