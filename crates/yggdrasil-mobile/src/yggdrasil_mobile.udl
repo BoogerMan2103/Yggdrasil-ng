@@ -1,0 +1,127 @@
+namespace yggdrasil_mobile {
+    /// Generate a new config with fresh random keys.
+    YggdrasilConfig generate_config();
+
+    /// Get the library version string.
+    string get_version();
+};
+
+// ── Errors ──────────────────────────────────────────────────────────────────
+
+[Error]
+enum YggdrasilError {
+    "Config",
+    "Runtime",
+    "Io",
+};
+
+// ── Config types ────────────────────────────────────────────────────────────
+
+dictionary MulticastInterfaceConfig {
+    string  regex;
+    boolean beacon;
+    boolean listen;
+    u16     port;
+    u8      priority;
+    string  password;
+};
+
+dictionary YggdrasilConfig {
+    /// Hex-encoded ed25519 keypair (128 hex chars = 64 bytes).
+    string                              private_key;
+    /// Peer URIs to connect to, e.g. "tcp://host:port".
+    sequence<string>                    peers;
+    /// Listen addresses, e.g. "tcp://[::]:0".
+    sequence<string>                    listen;
+    /// TUN MTU (default 65535).
+    u64                                 if_mtu;
+    /// Multicast interface configurations.
+    sequence<MulticastInterfaceConfig>  multicast_interfaces;
+    /// Device name for NodeInfo.
+    string                              node_info_name;
+};
+
+// ── State types ─────────────────────────────────────────────────────────────
+
+/// Current node state snapshot, returned by wait_for_state_update.
+dictionary YggdrasilState {
+    string  address;
+    string  subnet;
+    string  public_key;
+    i64     routing_entries;
+    string  peers_json;
+    string  tree_json;
+};
+
+/// Network interface info from Android ConnectivityManager.
+dictionary AndroidNetworkInterface {
+    string           name;
+    u32              index;
+    sequence<string> addrs;
+};
+
+// ── Callbacks ───────────────────────────────────────────────────────────────
+
+/// Callback for connectivity state changes.
+callback interface YggdrasilStateListener {
+    /// Yggdrasil overlay came online (first peer) or went offline (last peer).
+    void on_connectivity_changed(boolean is_online);
+};
+
+// ── Main interface ──────────────────────────────────────────────────────────
+
+interface YggdrasilMobile {
+    /// Create the node (allocates tokio runtime).
+    [Throws=YggdrasilError]
+    constructor(YggdrasilStateListener listener);
+
+    /// Start the Yggdrasil node with the given config.
+    [Throws=YggdrasilError]
+    void start(YggdrasilConfig config);
+
+    /// Receive an IPv6 packet from the network (blocks until available).
+    [Throws=YggdrasilError]
+    bytes recv_buffer();
+
+    /// Send an IPv6 packet from the TUN to the network.
+    [Throws=YggdrasilError]
+    void send_buffer(bytes buf);
+
+    /// Stop the node and release resources.
+    [Throws=YggdrasilError]
+    void stop();
+
+    /// Retry connecting to all configured peers immediately.
+    void retry_peers_now();
+
+    /// Long-poll: blocks until state changes or timeout_ms expires.
+    /// Returns current state snapshot.
+    YggdrasilState wait_for_state_update(u64 timeout_ms);
+
+    /// Get the node's IPv6 address as a string.
+    string get_address_string();
+
+    /// Get the node's IPv6 /64 subnet in CIDR notation.
+    string get_subnet_string();
+
+    /// Get the node's public key as a hex string.
+    string get_public_key_string();
+
+    /// Get the configured MTU.
+    i64 get_mtu();
+
+    /// Get the number of routing table entries.
+    i64 get_routing_entries();
+
+    /// Get peers as a JSON string.
+    string get_peers_json();
+
+    /// Get spanning tree as a JSON string.
+    string get_tree_json();
+
+    /// Provide network interface info from Android for multicast discovery.
+    void update_network_interfaces(sequence<AndroidNetworkInterface> interfaces);
+
+    /// Start multicast peer discovery.
+    void start_multicast();
+};
