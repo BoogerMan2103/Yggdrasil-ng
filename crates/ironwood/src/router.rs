@@ -964,15 +964,19 @@ impl Router {
         (root, ports)
     }
 
+    /// Get cached coordinates for a key. Computes and caches if not present.
+    fn cached_coords(&mut self, key: &PublicKey) -> Vec<PeerPort> {
+        if let Some(cached) = self.cache.get(key) {
+            return cached.clone();
+        }
+        let (_, path) = self.get_root_and_path(key);
+        self.cache.insert(*key, path.clone());
+        path
+    }
+
     /// Get distance between a path and a key in tree-space.
     fn get_dist(&mut self, dest_path: &[PeerPort], key: &PublicKey) -> u64 {
-        let key_path = if let Some(cached) = self.cache.get(key) {
-            cached.clone()
-        } else {
-            let (_, path) = self.get_root_and_path(key);
-            self.cache.insert(*key, path.clone());
-            path
-        };
+        let key_path = self.cached_coords(key);
 
         let end = dest_path.len().min(key_path.len());
         let mut dist = (key_path.len() + dest_path.len()) as u64;
@@ -995,7 +999,6 @@ impl Router {
     /// Greedy routing lookup: find the best next-hop peer.
     pub fn lookup(&mut self, path: &[PeerPort], watermark: &mut u64) -> Option<PeerId> {
         let self_key = self.crypto.public_key;
-        let (_, self_path) = self.get_root_and_path(&self_key);
         let self_dist = self.get_dist(path, &self_key);
         if self_dist >= *watermark {
             tracing::debug!("Lookup path {:?} - self too far (dist={} >= watermark={})", path, self_dist, watermark);
@@ -1004,15 +1007,14 @@ impl Router {
         let mut best_dist = self_dist;
         *watermark = self_dist;
 
-        tracing::debug!("Lookup path {:?} - self_path={:?} self_dist={}", path, self_path, self_dist);
+        tracing::debug!("Lookup path {:?} - self_dist={}", path, self_dist);
 
         // Collect candidates: peers closer than us
         let mut candidates: Vec<PeerEntry> = Vec::new();
         let peer_keys: Vec<PublicKey> = self.peers.keys().copied().collect();
         for k in &peer_keys {
-            let (_, peer_path) = self.get_root_and_path(k);
             let dist = self.get_dist(path, k);
-            tracing::trace!("  Peer {:02x?} path={:?} dist={} (closer={}) best_dist={}", hex::encode(&k[..8]), peer_path, dist, dist < best_dist, best_dist);
+            tracing::trace!("  Peer {:02x?} dist={} (closer={}) best_dist={}", hex::encode(&k[..8]), dist, dist < best_dist, best_dist);
             if dist < best_dist {
                 if let Some(peers) = self.peers.get(k) {
                     for (_, entry) in peers {
@@ -1101,8 +1103,8 @@ impl Router {
         // Use pathfinder to find path
         if let Some(path) = self.pathfinder.get_path(&tr.dest) {
             tr.path = path.to_vec();
-            let (_, from) = self.get_root_and_path(&self.crypto.public_key);
-            tr.from = from;
+            let self_key = self.crypto.public_key;
+            tr.from = self.cached_coords(&self_key);
 
             // Only cache when the slot is empty (consumed by a path-notify).
             // For a steady-state stream the path is stable so this runs at most
@@ -1172,7 +1174,7 @@ impl Router {
         self.pathfinder.mark_lookup_sent(dest);
 
         let self_key = self.crypto.public_key;
-        let (_, from) = self.get_root_and_path(&self_key);
+        let from = self.cached_coords(&self_key);
 
         let lookup = wire::PathLookup {
             source: self_key,
@@ -1221,7 +1223,7 @@ impl Router {
         tracing::debug!("Lookup self-check: dx={:?} sx={:?} match={}", hex::encode(&dx[..8]), hex::encode(&sx[..8]), dx == sx);
         if dx == sx {
             let self_key = self.crypto.public_key;
-            let (_, path) = self.get_root_and_path(&self_key);
+            let path = self.cached_coords(&self_key);
 
             let mut notify_info = crate::pathfinder::OwnPathInfo {
                 seq: std::time::SystemTime::now()
@@ -1320,8 +1322,8 @@ impl Router {
             // path was known).  We must set the correct path NOW or route_traffic will call
             // do_broken immediately, marking the freshly-stored path as broken again.
             traffic.path = notify.info.path.clone();
-            let (_, from) = self.get_root_and_path(&self.crypto.public_key);
-            traffic.from = from;
+            let self_key = self.crypto.public_key;
+            traffic.from = self.cached_coords(&self_key);
             actions.extend(self.route_traffic(traffic));
         }
 
