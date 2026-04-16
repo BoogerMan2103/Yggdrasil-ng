@@ -220,10 +220,9 @@ async fn encrypted_reader_loop(
         };
 
         let from_key = from_addr.0;
-        let data = buf[..n].to_vec();
 
         // Decrypt via session manager (per-session locking, no global mutex)
-        let actions = sessions.handle_data(&from_key, &data, &curve_priv, &signing_key);
+        let actions = sessions.handle_data(&from_key, &buf[..n], &curve_priv, &signing_key);
 
         // Process actions (all locks already released)
         for action in actions {

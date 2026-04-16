@@ -147,13 +147,12 @@ async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
 
 /// Read packets from the network (RWC) and send them to the channel.
 async fn tun_queue_loop(rwc: Arc<ReadWriteCloser>, tx: mpsc::Sender<Vec<u8>>) {
+    let mut buf = vec![0u8; 65535];
     loop {
-        let mut buf = vec![0u8; 65535];
         match rwc.read(&mut buf).await {
             Ok(n) => {
                 tracing::debug!("TUN read {} bytes, version={:#x}", n, buf[0] >> 4);
-                buf.truncate(n);
-                if tx.send(buf).await.is_err() {
+                if tx.send(buf[..n].to_vec()).await.is_err() {
                     tracing::error!("TUN queue channel closed");
                     return;
                 }

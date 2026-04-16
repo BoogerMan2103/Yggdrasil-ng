@@ -209,6 +209,9 @@ pub(crate) struct SessionInfo {
     // Stats
     pub rx: u64,
     pub tx: u64,
+
+    // Reusable buffer for do_send inner plaintext (avoids per-packet allocation)
+    send_inner_buf: Vec<u8>,
 }
 
 impl SessionInfo {
@@ -252,6 +255,7 @@ impl SessionInfo {
             last_activity: Instant::now(),
             rx: 0,
             tx: 0,
+            send_inner_buf: Vec::with_capacity(32 + 1500),
         }
     }
 
@@ -315,14 +319,14 @@ impl SessionInfo {
         wire::encode_uvarint(&mut bs, self.remote_key_seq);
         wire::encode_uvarint(&mut bs, self.send_nonce);
 
-        // Build inner payload: [nextPub(32)][msg]
-        let mut inner = Vec::with_capacity(32 + msg.len());
-        inner.extend_from_slice(&self.next_pub);
-        inner.extend_from_slice(msg);
+        // Build inner payload: [nextPub(32)][msg] — reuse buffer
+        self.send_inner_buf.clear();
+        self.send_inner_buf.extend_from_slice(&self.next_pub);
+        self.send_inner_buf.extend_from_slice(msg);
 
         // Encrypt
         let ciphertext =
-            box_seal_precomputed(&inner, self.send_nonce, &self.send_shared)
+            box_seal_precomputed(&self.send_inner_buf, self.send_nonce, &self.send_shared)
                 .map_err(|_| Error::Encode)?;
         bs.extend_from_slice(&ciphertext);
 
@@ -388,17 +392,17 @@ impl SessionInfo {
             DecryptCase::NextToRecv => &self.next_recv_shared,
         };
 
-        let unboxed = box_open_precomputed(encrypted, nonce, shared)
+        let mut unboxed = box_open_precomputed(encrypted, nonce, shared)
             .map_err(|_| RecvAction::SendInit)?;
 
         if unboxed.len() < 32 {
             return Err(RecvAction::Drop);
         }
 
-        // Extract inner key and message
+        // Extract inner key, then remove it from the buffer to get the payload
         let mut inner_key = [0u8; 32];
         inner_key.copy_from_slice(&unboxed[..32]);
-        let payload = unboxed[32..].to_vec();
+        unboxed.drain(..32);
 
         // Post-decrypt actions based on case
         match case {
@@ -415,9 +419,9 @@ impl SessionInfo {
             }
         }
 
-        self.rx += payload.len() as u64;
+        self.rx += unboxed.len() as u64;
         self.last_activity = Instant::now();
-        Ok(payload)
+        Ok(unboxed)
     }
 
     /// Possibly ratchet keys when receiving from remote's "next" key.

@@ -157,8 +157,8 @@ impl Core {
 
     /// Read a traffic packet from ironwood, stripping the session type byte.
     pub async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr), ironwood::Error> {
+        let mut inner_buf = vec![0u8; buf.len() + 1];
         loop {
-            let mut inner_buf = vec![0u8; buf.len() + 1];
             let (n, addr) = self.inner.read_from(&mut inner_buf).await?;
             tracing::debug!("Core read: {n} bytes with {} from {}", inner_buf[0], &addr);
             if n == 0 {

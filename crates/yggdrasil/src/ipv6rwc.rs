@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ironwood::Addr;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::address::{addr_for_key, is_valid_address, is_valid_subnet, subnet_for_key, Address, Subnet};
 use crate::core::Core;
@@ -36,16 +36,20 @@ pub struct ReadWriteCloser {
     core: Arc<Core>,
     address: Address,
     subnet: Subnet,
-    inner: Mutex<KeyStoreInner>,
+    lookups: RwLock<KeyStoreLookups>,
+    buffers: Mutex<KeyStoreBuffers>,
     mtu: u64,
     #[cfg(feature = "ckr")]
     ckr: Option<CryptoKey>,
 }
 
-struct KeyStoreInner {
+struct KeyStoreLookups {
     key_to_info: HashMap<[u8; 32], KeyInfo>,
     addr_to_info: HashMap<[u8; 16], [u8; 32]>,
     subnet_to_info: HashMap<[u8; 8], [u8; 32]>,
+}
+
+struct KeyStoreBuffers {
     addr_buffer: HashMap<[u8; 16], BufferedPacket>,
     subnet_buffer: HashMap<[u8; 8], BufferedPacket>,
 }
@@ -73,10 +77,12 @@ impl ReadWriteCloser {
             core,
             address,
             subnet,
-            inner: Mutex::new(KeyStoreInner {
+            lookups: RwLock::new(KeyStoreLookups {
                 key_to_info: HashMap::new(),
                 addr_to_info: HashMap::new(),
                 subnet_to_info: HashMap::new(),
+            }),
+            buffers: Mutex::new(KeyStoreBuffers {
                 addr_buffer: HashMap::new(),
                 subnet_buffer: HashMap::new(),
             }),
@@ -89,8 +95,8 @@ impl ReadWriteCloser {
     /// Read a packet from the network (Core) destined for the TUN.
     /// Returns the number of bytes written to `buf`.
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
+        let mut inner_buf = vec![0u8; 65536];
         loop {
-            let mut inner_buf = vec![0u8; 65536];
             let (n, from_addr) = self
                 .core
                 .read_from(&mut inner_buf)
@@ -174,8 +180,8 @@ impl ReadWriteCloser {
 
             // Verify source address matches the key we got it from
             let src_valid = {
-                let store = self.inner.lock().await;
-                if let Some(info) = store.key_to_info.get(&from_key) {
+                let lookups = self.lookups.read().await;
+                if let Some(info) = lookups.key_to_info.get(&from_key) {
                     let src_addr_match = src_ip == info.address.0;
                     let mut src_subnet_bytes = [0u8; 8];
                     src_subnet_bytes.copy_from_slice(&src_ip[..8]);
@@ -252,13 +258,13 @@ impl ReadWriteCloser {
             return Err("invalid destination address".to_string());
         }
 
-        // Look up the destination key
+        // Look up the destination key (read-only)
         let key = {
-            let store = self.inner.lock().await;
+            let lookups = self.lookups.read().await;
             if dst_addr_valid {
-                store.addr_to_info.get(&dst_ip).copied()
+                lookups.addr_to_info.get(&dst_ip).copied()
             } else {
-                store.subnet_to_info.get(&dst_subnet_prefix).copied()
+                lookups.subnet_to_info.get(&dst_subnet_prefix).copied()
             }
         };
 
@@ -273,7 +279,7 @@ impl ReadWriteCloser {
         } else {
             // Unknown destination, buffer the packet and send lookup
             tracing::debug!("RWC write: key unknown {}, buffering + lookup", Address(dst_ip));
-            let mut store = self.inner.lock().await;
+            let mut buffers = self.buffers.lock().await;
 
             let buffered = BufferedPacket {
                 data: buf.to_vec(),
@@ -282,14 +288,14 @@ impl ReadWriteCloser {
 
             // Determine the lookup key from the address/subnet
             let lookup_key = if dst_addr_valid {
-                store.addr_buffer.insert(dst_ip, buffered);
+                buffers.addr_buffer.insert(dst_ip, buffered);
                 Address(dst_ip).get_key()
             } else {
-                store.subnet_buffer.insert(dst_subnet_prefix, buffered);
+                buffers.subnet_buffer.insert(dst_subnet_prefix, buffered);
                 Subnet(dst_subnet_prefix).get_key()
             };
 
-            drop(store);
+            drop(buffers);
 
             // Send lookup
             self.core.send_lookup(Addr(lookup_key)).await;
@@ -305,22 +311,26 @@ impl ReadWriteCloser {
         tracing::trace!("RWC update_key: learned {} -> {}", address, hex::encode(&key[..8]));
         let now = Instant::now();
 
-        let mut store = self.inner.lock().await;
-
-        // Update or insert key info
-        let info = KeyInfo {
-            address,
-            subnet,
-            last_seen: now,
-        };
-        store.key_to_info.insert(key, info);
-        store.addr_to_info.insert(address.0, key);
-        store.subnet_to_info.insert(subnet.0, key);
+        // Update lookup maps (write lock)
+        {
+            let mut lookups = self.lookups.write().await;
+            let info = KeyInfo {
+                address,
+                subnet,
+                last_seen: now,
+            };
+            lookups.key_to_info.insert(key, info);
+            lookups.addr_to_info.insert(address.0, key);
+            lookups.subnet_to_info.insert(subnet.0, key);
+        }
 
         // Flush any buffered packets for this address/subnet
-        let addr_buf = store.addr_buffer.remove(&address.0);
-        let subnet_buf = store.subnet_buffer.remove(&subnet.0);
-        drop(store);
+        let (addr_buf, subnet_buf) = {
+            let mut buffers = self.buffers.lock().await;
+            let a = buffers.addr_buffer.remove(&address.0);
+            let s = buffers.subnet_buffer.remove(&subnet.0);
+            (a, s)
+        };
 
         if let Some(buffered) = addr_buf {
             if buffered.time.elapsed() < KEY_STORE_TIMEOUT {
@@ -339,30 +349,34 @@ impl ReadWriteCloser {
 
     /// Clean up expired entries from the key store.
     pub async fn cleanup(&self) {
-        let mut store = self.inner.lock().await;
-
         // Remove expired key infos
-        let expired_keys: Vec<[u8; 32]> = store
-            .key_to_info
-            .iter()
-            .filter(|(_, info)| info.last_seen.elapsed() > KEY_STORE_TIMEOUT)
-            .map(|(key, _)| *key)
-            .collect();
+        {
+            let mut lookups = self.lookups.write().await;
+            let expired_keys: Vec<[u8; 32]> = lookups
+                .key_to_info
+                .iter()
+                .filter(|(_, info)| info.last_seen.elapsed() > KEY_STORE_TIMEOUT)
+                .map(|(key, _)| *key)
+                .collect();
 
-        for key in expired_keys {
-            if let Some(info) = store.key_to_info.remove(&key) {
-                store.addr_to_info.remove(&info.address.0);
-                store.subnet_to_info.remove(&info.subnet.0);
+            for key in expired_keys {
+                if let Some(info) = lookups.key_to_info.remove(&key) {
+                    lookups.addr_to_info.remove(&info.address.0);
+                    lookups.subnet_to_info.remove(&info.subnet.0);
+                }
             }
         }
 
         // Remove expired buffers
-        store
-            .addr_buffer
-            .retain(|_, buf| buf.time.elapsed() < KEY_STORE_TIMEOUT);
-        store
-            .subnet_buffer
-            .retain(|_, buf| buf.time.elapsed() < KEY_STORE_TIMEOUT);
+        {
+            let mut buffers = self.buffers.lock().await;
+            buffers
+                .addr_buffer
+                .retain(|_, buf| buf.time.elapsed() < KEY_STORE_TIMEOUT);
+            buffers
+                .subnet_buffer
+                .retain(|_, buf| buf.time.elapsed() < KEY_STORE_TIMEOUT);
+        }
     }
 
     pub fn mtu(&self) -> u64 {
@@ -388,8 +402,8 @@ impl ReadWriteCloser {
             let mut src_ip = [0u8; 16];
             src_ip.copy_from_slice(&packet[8..24]);
 
-            let store = self.inner.lock().await;
-            if let Some(info) = store.key_to_info.get(from_key) {
+            let lookups = self.lookups.read().await;
+            if let Some(info) = lookups.key_to_info.get(from_key) {
                 let src_addr_match = src_ip == info.address.0;
                 let mut src_subnet_bytes = [0u8; 8];
                 src_subnet_bytes.copy_from_slice(&src_ip[..8]);
@@ -398,7 +412,7 @@ impl ReadWriteCloser {
                     return true;
                 }
             }
-            drop(store);
+            drop(lookups);
         }
 
         // For IPv4 or non-Ygg IPv6: validate source against CKR routing table
@@ -460,13 +474,13 @@ impl ReadWriteCloser {
             let dst_subnet_valid = is_valid_subnet(&dst_subnet_prefix);
 
             if dst_addr_valid || dst_subnet_valid {
-                // Use standard Yggdrasil routing path
+                // Use standard Yggdrasil routing path (read-only lookup)
                 let key = {
-                    let store = self.inner.lock().await;
+                    let lookups = self.lookups.read().await;
                     if dst_addr_valid {
-                        store.addr_to_info.get(&dst_addr_bytes).copied()
+                        lookups.addr_to_info.get(&dst_addr_bytes).copied()
                     } else {
-                        store.subnet_to_info.get(&dst_subnet_prefix).copied()
+                        lookups.subnet_to_info.get(&dst_subnet_prefix).copied()
                     }
                 };
 
@@ -479,19 +493,19 @@ impl ReadWriteCloser {
                         .map_err(|e| format!("core write: {}", e));
                 } else {
                     // Buffer and lookup
-                    let mut store = self.inner.lock().await;
+                    let mut buffers = self.buffers.lock().await;
                     let buffered = BufferedPacket {
                         data: buf.to_vec(),
                         time: Instant::now(),
                     };
                     let lookup_key = if dst_addr_valid {
-                        store.addr_buffer.insert(dst_addr_bytes, buffered);
+                        buffers.addr_buffer.insert(dst_addr_bytes, buffered);
                         Address(dst_addr_bytes).get_key()
                     } else {
-                        store.subnet_buffer.insert(dst_subnet_prefix, buffered);
+                        buffers.subnet_buffer.insert(dst_subnet_prefix, buffered);
                         Subnet(dst_subnet_prefix).get_key()
                     };
-                    drop(store);
+                    drop(buffers);
                     self.core.send_lookup(Addr(lookup_key)).await;
                     return Ok(buf.len());
                 }
