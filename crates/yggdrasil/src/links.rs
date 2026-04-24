@@ -125,6 +125,15 @@ const MINIMUM_BACKOFF_LIMIT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Maximum shift for exponential backoff (dial wait = 1 << shift seconds),
+// further clamped by options.max_backoff.
+const BACKOFF_SHIFT_MAX: u32 = 16;
+
+// If a peering stayed up at least this long, treat the disconnect as a
+// network-jitter event and reset backoff — not a broken peer we should
+// back off from.
+const BACKOFF_RESET_UPTIME: Duration = Duration::from_secs(30);
+
 // Maximum concurrent incoming connections being processed
 const MAX_CONCURRENT_INCOMING: usize = 350;
 
@@ -812,8 +821,8 @@ impl Links {
                                     tracing::debug!("{} to {}", err_msg, target);
                                     peer_errors.lock().await.insert(uri_str.clone(), Some(err_msg));
                                     // Continue to backoff logic below
-                                    backoff = (backoff + 1).min(7);
-                                    let wait = Duration::from_secs(1u64 << backoff.min(7))
+                                    backoff = (backoff + 1).min(BACKOFF_SHIFT_MAX);
+                                    let wait = Duration::from_secs(1u64 << backoff.min(BACKOFF_SHIFT_MAX))
                                         .min(options.max_backoff);
                                     tokio::select! {
                                         _ = cancel_clone.cancelled() => break,
@@ -830,11 +839,19 @@ impl Links {
                         // Connected successfully — clear error
                         peer_errors.lock().await.insert(uri_str.clone(), None);
 
-                        match handle_connection(LinkType::Persistent, options.clone(), wrapped_stream, &core, &active, &uri_str).await {
+                        let conn_start = Instant::now();
+                        let result = handle_connection(LinkType::Persistent, options.clone(), wrapped_stream, &core, &active, &uri_str).await;
+
+                        // Reset backoff on clean shutdown OR if the peering stayed
+                        // up long enough that the disconnect was almost certainly a
+                        // transient network event, not a broken peer.
+                        if result.is_ok() || conn_start.elapsed() >= BACKOFF_RESET_UPTIME {
+                            backoff = 0;
+                        }
+
+                        match result {
                             Ok(()) => {
-                                // Clean disconnection - reset backoff
                                 peer_errors.lock().await.insert(uri_str.clone(), None);
-                                backoff = 0;
                             }
                             Err(e) => {
                                 peer_errors.lock().await.insert(uri_str.clone(), Some(e.to_string()));
@@ -856,7 +873,7 @@ impl Links {
                 if backoff < 32 {
                     backoff += 1;
                 }
-                let wait = Duration::from_secs(1u64 << backoff.min(7))
+                let wait = Duration::from_secs(1u64 << backoff.min(BACKOFF_SHIFT_MAX))
                     .min(options.max_backoff);
 
                 tokio::select! {

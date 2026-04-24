@@ -7,7 +7,12 @@ use std::net::Ipv6Addr;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, Notify};
+
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use tokio::io::{unix::AsyncFd, Interest};
 
 use yggdrasil::address::addr_for_key;
 use yggdrasil::config;
@@ -239,6 +244,18 @@ struct NodeState {
     core: Arc<Core>,
     rwc: Arc<ReadWriteCloser>,
     stop_tx: broadcast::Sender<()>,
+    #[cfg(unix)]
+    tun: Option<TunState>,
+}
+
+#[cfg(unix)]
+struct TunState {
+    tun_stop: broadcast::Sender<()>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+    // The Arc is shared with the spawned tasks; when they exit and drop their
+    // clones, the final drop here closes the underlying fd via File's Drop.
+    _async_fd: Arc<AsyncFd<std::fs::File>>,
 }
 
 // ── YggdrasilMobile ─────────────────────────────────────────────────────────
@@ -247,8 +264,11 @@ pub struct YggdrasilMobile {
     rt: Arc<tokio::runtime::Runtime>,
     state: Mutex<Option<NodeState>>,
     listener: Arc<dyn YggdrasilStateListener>,
-    state_notify: watch::Sender<()>,
-    state_rx: Mutex<watch::Receiver<()>>,
+    // Notify has "at most one pending permit" semantics: if notify_one() fires
+    // before notified().await, the await returns immediately. That is exactly
+    // the behaviour we want for state updates — we don't want to miss a peer
+    // event that lands while the Kotlin updater thread is being spawned.
+    state_notify: Arc<Notify>,
 }
 
 impl YggdrasilMobile {
@@ -260,14 +280,11 @@ impl YggdrasilMobile {
             .build()
             .map_err(|e| YggdrasilError::Runtime(e.to_string()))?;
 
-        let (state_notify, state_rx) = watch::channel(());
-
         Ok(Self {
             rt: Arc::new(rt),
             state: Mutex::new(None),
             listener: Arc::from(listener),
-            state_notify,
-            state_rx: Mutex::new(state_rx),
+            state_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -295,7 +312,7 @@ impl YggdrasilMobile {
         {
             let cb = Arc::clone(&self.listener);
             let core_ref = Arc::clone(&core);
-            let notify = self.state_notify.clone();
+            let notify = Arc::clone(&self.state_notify);
             let mut peer_rx = core.subscribe_peer_events();
             let mut stop_rx = stop_tx.subscribe();
 
@@ -313,7 +330,7 @@ impl YggdrasilMobile {
                                         is_online = now_online;
                                         cb.on_connectivity_changed(now_online);
                                     }
-                                    let _ = notify.send(());
+                                    notify.notify_one();
                                 }
                                 Err(broadcast::error::RecvError::Closed) => break,
                             }
@@ -328,6 +345,8 @@ impl YggdrasilMobile {
             core,
             rwc,
             stop_tx,
+            #[cfg(unix)]
+            tun: None,
         });
 
         Ok(())
@@ -369,6 +388,150 @@ impl YggdrasilMobile {
         Ok(())
     }
 
+    #[cfg(unix)]
+    pub fn start_tun(&self, fd: i32) -> Result<(), YggdrasilError> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let mut guard = self.state.lock().unwrap();
+        let ns = guard
+            .as_mut()
+            .ok_or_else(|| YggdrasilError::Runtime("node not started".to_string()))?;
+
+        if ns.tun.is_some() {
+            return Err(YggdrasilError::Runtime("tun already started".to_string()));
+        }
+
+        // Adopt the fd. Ownership transfers here; closed on Drop.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let file = std::fs::File::from(owned);
+
+        // AsyncFd registers the fd with the tokio reactor; must be called inside
+        // a runtime context. Creation is synchronous (no await).
+        let async_fd = {
+            let _enter = self.rt.enter();
+            Arc::new(
+                AsyncFd::with_interest(file, Interest::READABLE | Interest::WRITABLE)
+                    .map_err(|e| YggdrasilError::Io(e.to_string()))?,
+            )
+        };
+
+        let (tun_stop_tx, _) = broadcast::channel::<()>(1);
+
+        // Reader task: TUN -> network
+        let reader = {
+            let async_fd = Arc::clone(&async_fd);
+            let rwc = Arc::clone(&ns.rwc);
+            let mut stop_rx = tun_stop_tx.subscribe();
+            self.rt.spawn(async move {
+                let mut buf = vec![0u8; 65536].into_boxed_slice();
+                loop {
+                    let mut rguard = tokio::select! {
+                        _ = stop_rx.recv() => break,
+                        r = async_fd.readable() => match r {
+                            Ok(g) => g,
+                            Err(e) => {
+                                tracing::warn!("tun readable() failed: {}", e);
+                                break;
+                            }
+                        },
+                    };
+                    match rguard.try_io(|inner| (&*inner.get_ref()).read(&mut buf[..])) {
+                        Ok(Ok(0)) => break, // EOF — tun closed
+                        Ok(Ok(n)) => {
+                            // Ignore write errors: the TUN forwards non-Yggdrasil
+                            // packets too, which rwc rightly rejects. Matches the
+                            // behaviour of the old send_buffer path.
+                            let _ = rwc.write(&buf[..n]).await;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("tun read error: {}", e);
+                            break;
+                        }
+                        Err(_would_block) => continue,
+                    }
+                }
+            })
+        };
+
+        // Writer task: network -> TUN
+        let writer = {
+            let async_fd = Arc::clone(&async_fd);
+            let rwc = Arc::clone(&ns.rwc);
+            let mut stop_rx = tun_stop_tx.subscribe();
+            self.rt.spawn(async move {
+                let mut buf = vec![0u8; 65536].into_boxed_slice();
+                loop {
+                    let n = tokio::select! {
+                        _ = stop_rx.recv() => break,
+                        r = rwc.read(&mut buf[..]) => match r {
+                            Ok(n) if n > 0 => n,
+                            Ok(_) => continue,
+                            Err(e) => {
+                                tracing::warn!("rwc read error: {}", e);
+                                continue;
+                            }
+                        },
+                    };
+                    // Drive the write to completion, yielding on EAGAIN.
+                    loop {
+                        let mut wguard = tokio::select! {
+                            _ = stop_rx.recv() => return,
+                            w = async_fd.writable() => match w {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    tracing::warn!("tun writable() failed: {}", e);
+                                    return;
+                                }
+                            },
+                        };
+                        match wguard.try_io(|inner| (&*inner.get_ref()).write(&buf[..n])) {
+                            Ok(Ok(_)) => break,
+                            Ok(Err(e)) => {
+                                tracing::warn!("tun write error: {}", e);
+                                break;
+                            }
+                            Err(_would_block) => continue,
+                        }
+                    }
+                }
+            })
+        };
+
+        ns.tun = Some(TunState {
+            tun_stop: tun_stop_tx,
+            reader,
+            writer,
+            _async_fd: async_fd,
+        });
+
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn start_tun(&self, _fd: i32) -> Result<(), YggdrasilError> {
+        Err(YggdrasilError::Io(
+            "start_tun is only supported on Unix targets".to_string(),
+        ))
+    }
+
+    pub fn stop_tun(&self) -> Result<(), YggdrasilError> {
+        #[cfg(unix)]
+        {
+            let tun = {
+                let mut guard = self.state.lock().unwrap();
+                guard.as_mut().and_then(|ns| ns.tun.take())
+            };
+            if let Some(tun) = tun {
+                let _ = tun.tun_stop.send(());
+                self.rt.block_on(async {
+                    let _ = tokio::join!(tun.reader, tun.writer);
+                });
+                // tun._async_fd drops here; fd closes with it.
+            }
+        }
+        Ok(())
+    }
+
     pub fn stop(&self) -> Result<(), YggdrasilError> {
         let node_state = {
             let mut guard = self.state.lock().unwrap();
@@ -376,6 +539,14 @@ impl YggdrasilMobile {
         };
 
         if let Some(ns) = node_state {
+            #[cfg(unix)]
+            if let Some(tun) = ns.tun {
+                let _ = tun.tun_stop.send(());
+                self.rt.block_on(async {
+                    let _ = tokio::join!(tun.reader, tun.writer);
+                });
+            }
+
             let _ = ns.stop_tx.send(());
             self.rt.block_on(async {
                 ns.core.close_multicast().await;
@@ -394,18 +565,16 @@ impl YggdrasilMobile {
     }
 
     pub fn wait_for_state_update(&self, timeout_ms: u64) -> YggdrasilState {
-        // Clone the receiver to avoid holding the Mutex across an await
-        let mut rx = {
-            let guard = self.state_rx.lock().unwrap();
-            guard.clone()
-        };
-
+        // Notify::notified() returns immediately if notify_one() was called
+        // since the last consumption, and otherwise waits. That means a peer
+        // event that lands between start() and the Kotlin updater's first call
+        // here is NOT lost — we return right away and the UI reflects the
+        // connected state without waiting out the timeout.
+        let notify = Arc::clone(&self.state_notify);
         self.rt.block_on(async {
-            // Mark current value as seen, then wait for a change or timeout.
-            rx.borrow_and_update();
             let _ = tokio::time::timeout(
                 Duration::from_millis(timeout_ms),
-                rx.changed(),
+                notify.notified(),
             )
             .await;
         });

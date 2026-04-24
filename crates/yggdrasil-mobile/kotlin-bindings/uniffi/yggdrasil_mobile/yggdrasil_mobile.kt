@@ -688,7 +688,11 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_start_multicast(
     ): Short
+    external fun uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_start_tun(
+    ): Short
     external fun uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_stop(
+    ): Short
+    external fun uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_stop_tun(
     ): Short
     external fun uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_update_network_interfaces(
     ): Short
@@ -747,7 +751,11 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_start_multicast(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_start_tun(`ptr`: Long,`fd`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_stop(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_stop_tun(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_update_network_interfaces(`ptr`: Long,`interfaces`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -925,7 +933,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_start_multicast() != 43198.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_start_tun() != 57395.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_stop() != 49043.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_stop_tun() != 43772.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_update_network_interfaces() != 37792.toShort()) {
@@ -1194,6 +1208,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 
     override fun write(value: UInt, buf: ByteBuffer) {
         buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterInt: FfiConverter<Int, Int> {
+    override fun lift(value: Int): Int {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Int {
+        return buf.getInt()
+    }
+
+    override fun lower(value: Int): Int {
+        return value
+    }
+
+    override fun allocationSize(value: Int) = 4UL
+
+    override fun write(value: Int, buf: ByteBuffer) {
+        buf.putInt(value)
     }
 }
 
@@ -1477,6 +1514,7 @@ public interface YggdrasilMobileInterface {
     
     /**
      * Receive an IPv6 packet from the network (blocks until available).
+     * Kept for platforms without a TUN fd (e.g. iOS NEPacketTunnelProvider) and tests.
      */
     fun `recvBuffer`(): kotlin.ByteArray
     
@@ -1487,6 +1525,7 @@ public interface YggdrasilMobileInterface {
     
     /**
      * Send an IPv6 packet from the TUN to the network.
+     * Kept for platforms without a TUN fd (e.g. iOS NEPacketTunnelProvider) and tests.
      */
     fun `sendBuffer`(`buf`: kotlin.ByteArray)
     
@@ -1501,9 +1540,21 @@ public interface YggdrasilMobileInterface {
     fun `startMulticast`()
     
     /**
+     * Start Rust-owned TUN read/write loops on the given fd.
+     * Ownership of the fd transfers to Rust; the caller must not close it.
+     * The fd must be non-blocking (on Android: VpnService.Builder.setBlocking(false)).
+     */
+    fun `startTun`(`fd`: kotlin.Int)
+    
+    /**
      * Stop the node and release resources.
      */
     fun `stop`()
+    
+    /**
+     * Stop the TUN loops and close the fd. Safe to call multiple times.
+     */
+    fun `stopTun`()
     
     /**
      * Provide network interface info from Android for multicast discovery.
@@ -1741,6 +1792,7 @@ open class YggdrasilMobile: Disposable, AutoCloseable, YggdrasilMobileInterface
     
     /**
      * Receive an IPv6 packet from the network (blocks until available).
+     * Kept for platforms without a TUN fd (e.g. iOS NEPacketTunnelProvider) and tests.
      */
     @Throws(YggdrasilException::class)override fun `recvBuffer`(): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
@@ -1773,6 +1825,7 @@ open class YggdrasilMobile: Disposable, AutoCloseable, YggdrasilMobileInterface
     
     /**
      * Send an IPv6 packet from the TUN to the network.
+     * Kept for platforms without a TUN fd (e.g. iOS NEPacketTunnelProvider) and tests.
      */
     @Throws(YggdrasilException::class)override fun `sendBuffer`(`buf`: kotlin.ByteArray)
         = 
@@ -1819,6 +1872,24 @@ open class YggdrasilMobile: Disposable, AutoCloseable, YggdrasilMobileInterface
 
     
     /**
+     * Start Rust-owned TUN read/write loops on the given fd.
+     * Ownership of the fd transfers to Rust; the caller must not close it.
+     * The fd must be non-blocking (on Android: VpnService.Builder.setBlocking(false)).
+     */
+    @Throws(YggdrasilException::class)override fun `startTun`(`fd`: kotlin.Int)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(YggdrasilException) { _status ->
+    UniffiLib.uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_start_tun(
+        it,
+        FfiConverterInt.lower(`fd`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Stop the node and release resources.
      */
     @Throws(YggdrasilException::class)override fun `stop`()
@@ -1826,6 +1897,22 @@ open class YggdrasilMobile: Disposable, AutoCloseable, YggdrasilMobileInterface
     callWithHandle {
     uniffiRustCallWithError(YggdrasilException) { _status ->
     UniffiLib.uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_stop(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Stop the TUN loops and close the fd. Safe to call multiple times.
+     */
+    @Throws(YggdrasilException::class)override fun `stopTun`()
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(YggdrasilException) { _status ->
+    UniffiLib.uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_stop_tun(
         it,
         _status)
 }
@@ -1999,7 +2086,7 @@ public object FfiConverterTypeCkrRemoteSubnet: FfiConverterRustBuffer<CkrRemoteS
 
 
 data class MulticastInterfaceConfig (
-    var `regex`: kotlin.String
+    var `filter`: kotlin.String
     , 
     var `beacon`: kotlin.Boolean
     , 
@@ -2036,7 +2123,7 @@ public object FfiConverterTypeMulticastInterfaceConfig: FfiConverterRustBuffer<M
     }
 
     override fun allocationSize(value: MulticastInterfaceConfig) = (
-            FfiConverterString.allocationSize(value.`regex`) +
+            FfiConverterString.allocationSize(value.`filter`) +
             FfiConverterBoolean.allocationSize(value.`beacon`) +
             FfiConverterBoolean.allocationSize(value.`listen`) +
             FfiConverterUShort.allocationSize(value.`port`) +
@@ -2045,7 +2132,7 @@ public object FfiConverterTypeMulticastInterfaceConfig: FfiConverterRustBuffer<M
     )
 
     override fun write(value: MulticastInterfaceConfig, buf: ByteBuffer) {
-            FfiConverterString.write(value.`regex`, buf)
+            FfiConverterString.write(value.`filter`, buf)
             FfiConverterBoolean.write(value.`beacon`, buf)
             FfiConverterBoolean.write(value.`listen`, buf)
             FfiConverterUShort.write(value.`port`, buf)

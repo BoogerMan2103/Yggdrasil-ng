@@ -107,12 +107,24 @@ interface YggdrasilMobile {
     void start(YggdrasilConfig config);
 
     /// Receive an IPv6 packet from the network (blocks until available).
+    /// Kept for platforms without a TUN fd (e.g. iOS NEPacketTunnelProvider) and tests.
     [Throws=YggdrasilError]
     bytes recv_buffer();
 
     /// Send an IPv6 packet from the TUN to the network.
+    /// Kept for platforms without a TUN fd (e.g. iOS NEPacketTunnelProvider) and tests.
     [Throws=YggdrasilError]
     void send_buffer(bytes buf);
+
+    /// Start Rust-owned TUN read/write loops on the given fd.
+    /// Ownership of the fd transfers to Rust; the caller must not close it.
+    /// The fd must be non-blocking (on Android: VpnService.Builder.setBlocking(false)).
+    [Throws=YggdrasilError]
+    void start_tun(i32 fd);
+
+    /// Stop the TUN loops and close the fd. Safe to call multiple times.
+    [Throws=YggdrasilError]
+    void stop_tun();
 
     /// Stop the node and release resources.
     [Throws=YggdrasilError]
