@@ -80,6 +80,7 @@ pub struct YggdrasilConfig {
     pub multicast_interfaces: Vec<MulticastInterfaceConfig>,
     pub node_info_name: String,
     pub tunnel_routing: TunnelRoutingConfig,
+    pub group_password: String,
 }
 
 pub struct CkrRemoteSubnet {
@@ -164,7 +165,8 @@ fn convert_config(cfg: &YggdrasilConfig) -> config::Config {
             // try to install OS routes from the unprivileged app process.
             install_system_routes: false,
         },
-        firewall
+        firewall,
+        group_password: cfg.group_password.clone(),
     }
 }
 
@@ -200,6 +202,7 @@ fn config_to_udl(cfg: &config::Config) -> YggdrasilConfig {
             ipv4_address: String::new(),
             remote_subnets: Vec::new(),
         },
+        group_password: cfg.group_password.clone(),
     }
 }
 
