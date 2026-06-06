@@ -60,7 +60,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p yggdrasil --features ckr
+        run: cargo build --release --target ${{ matrix.target }} -p yggdrasil
 
       - name: Download wintun
         shell: pwsh

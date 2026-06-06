@@ -42,7 +42,7 @@ rustc-hash = "2.1.2"
 arc-swap = "1.9"
 
 [features]
-default = ["ctl", "tun", "systemd"]
+default = ["ctl", "tun", "systemd", "ckr"]
 ctl = []
 tun = ["dep:tun-rs"]
 ckr = ["dep:route_manager"]
