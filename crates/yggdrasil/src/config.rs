@@ -289,6 +289,58 @@ impl Config {
     }
 }
 
+/// Config file format, inferred from the file extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigFormat {
+    Toml,
+    Yaml,
+}
+
+impl ConfigFormat {
+    /// Infer the format from a path's extension. `.yaml`/`.yml` (case-insensitive)
+    /// map to YAML; everything else (including no extension) stays TOML, which
+    /// preserves the historical default.
+    pub fn from_path(path: &str) -> Self {
+        match std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("yaml") | Some("yml") => ConfigFormat::Yaml,
+            _ => ConfigFormat::Toml,
+        }
+    }
+}
+
+/// Errors returned by [`Config::load`] / [`Config::parse`].
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("reading config file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid TOML config: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("invalid YAML config: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+}
+
+impl Config {
+    /// Parse a config from raw text using the given format.
+    pub fn parse(text: &str, format: ConfigFormat) -> Result<Self, ConfigError> {
+        match format {
+            ConfigFormat::Toml => Ok(toml::from_str::<Config>(text)?),
+            ConfigFormat::Yaml => Ok(serde_yaml::from_str::<Config>(text)?),
+        }
+    }
+
+    /// Read and parse a config from a file, picking the parser by extension
+    /// (`.yaml`/`.yml` -> YAML, everything else -> TOML).
+    pub fn load(path: &str) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)?;
+        Self::parse(&text, ConfigFormat::from_path(path))
+    }
+}
+
 /// Errors returned by [`Config::normalize_config_text`].
 #[derive(Debug, thiserror::Error)]
 pub enum NormalizeError {

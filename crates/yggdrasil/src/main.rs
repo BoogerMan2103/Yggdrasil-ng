@@ -143,9 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = if autoconf {
         Config::default()
     } else if !config_path.is_empty() {
-        let file = File::open(&config_path)?;
-        let config = std::io::read_to_string(file)?;
-        toml::from_str::<Config>(&config)?
+        Config::load(&config_path)?
     } else {
         tracing::error!("Please specify --genconf, --config, or --autoconf");
         std::process::exit(1);
@@ -240,9 +238,7 @@ async fn run_node(
     let config = if autoconf {
         Config::default()
     } else if !config_path.is_empty() {
-        let file = File::open(&config_path)?;
-        let text = std::io::read_to_string(file)?;
-        toml::from_str::<Config>(&text)?
+        Config::load(&config_path)?
     } else {
         return Err("No configuration: specify --config or --autoconf".into());
     };
