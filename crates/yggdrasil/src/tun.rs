@@ -158,6 +158,11 @@ impl TunAdapter {
             }
         }
 
+        // Let the RWC know the resolved TUN name so runtime subnet additions
+        // (addSubnet) can install/remove system routes on this interface.
+        #[cfg(feature = "ckr")]
+        rwc.set_ckr_tun_name(tun_name);
+
         // Assign DNS servers to the interface (Windows only). Non-fatal on error.
         #[cfg(windows)]
         if !dns_servers.is_empty() {

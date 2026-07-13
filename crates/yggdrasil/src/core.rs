@@ -156,6 +156,33 @@ impl Core {
         *slot = Some(rwc);
     }
 
+    /// Get the ReadWriteCloser once the TUN bridge has been wired up.
+    fn rwc(&self) -> Result<Arc<ReadWriteCloser>, String> {
+        self.path_notify_slot
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "TUN bridge not ready".to_string())
+    }
+
+    /// Add CKR subnets routed via `key_hex` at runtime (no restart, in-memory).
+    #[cfg(feature = "ckr")]
+    pub fn ckr_add_subnet(&self, key_hex: &str, cidrs: Vec<String>) -> Result<(), String> {
+        self.rwc()?.ckr_add_subnet(key_hex, cidrs)
+    }
+
+    /// Remove all CKR subnets routed via `key_hex` at runtime.
+    #[cfg(feature = "ckr")]
+    pub fn ckr_remove_subnet(&self, key_hex: &str) -> Result<(), String> {
+        self.rwc()?.ckr_remove_subnet(key_hex)
+    }
+
+    /// List the current CKR remote-subnet map.
+    #[cfg(feature = "ckr")]
+    pub fn ckr_list(&self) -> Result<Vec<(String, Vec<String>)>, String> {
+        Ok(self.rwc()?.ckr_list())
+    }
+
     /// Read a traffic packet from ironwood, stripping the session type byte.
     pub async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr), ironwood::Error> {
         let mut inner_buf = vec![0u8; buf.len() + 1];

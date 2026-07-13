@@ -260,6 +260,33 @@ pub async fn run_ctl(
             }
         }
 
+        "getsubnets" => {
+            let subnets = response.get("subnets").and_then(|v| v.as_array());
+            match subnets {
+                Some(list) if !list.is_empty() => {
+                    let header = vec!["Public Key", "Subnets"];
+                    let rows: Vec<Vec<String>> = list
+                        .iter()
+                        .map(|s| {
+                            let cidrs = s
+                                .get("subnets")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|c| c.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            vec![json_str(s, "key"), cidrs]
+                        })
+                        .collect();
+                    print_table(&header, &rows);
+                }
+                _ => println!("No CKR subnets configured."),
+            }
+        }
+
         _ => {
             println!("{}", serde_json::to_string_pretty(response)?);
         }

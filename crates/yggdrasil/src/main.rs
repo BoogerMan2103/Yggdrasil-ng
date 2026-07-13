@@ -487,6 +487,8 @@ fn print_ctl_commands() {
     println!("    getDebug  (routing stats: tree size, broken paths, queue depth, etc.)");
     println!("  Peer management:");
     println!("    addPeer uri=<URI>, removePeer uri=<URI>");
+    println!("  CKR subnet management (runtime, not persisted):");
+    println!("    addSubnet key=<hex> subnet=<CIDR[,CIDR...]>, removeSubnet key=<hex>, getSubnets");
     println!("  Remote queries:");
     println!("    getNodeInfo key=<hex>, debug_remoteGetSelf key=<hex>");
     println!("    debug_remoteGetPeers key=<hex>, debug_remoteGetTree key=<hex>");

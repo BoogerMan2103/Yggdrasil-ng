@@ -398,6 +398,70 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
     }
 }
 
+/// Expand a single remote-subnet list into the system-routable CIDRs it
+/// implies: `~`-prefixed entries (CKR-only, no system route) are skipped, the
+/// rest are normalized and expanded (excludes applied, keywords resolved).
+/// Used for incremental route install/removal at runtime.
+pub fn routable_cidrs(subnet_list: &[String]) -> Result<Vec<IpNet>, String> {
+    let non_tilde: Vec<String> = subnet_list
+        .iter()
+        .filter(|s| !s.trim().starts_with('~'))
+        .cloned()
+        .collect();
+    let route_list = normalize_subnet_entries(&non_tilde);
+    expand_cidrs(&route_list)
+}
+
+/// Install a set of system routes pointing at the given TUN interface.
+/// Best-effort: individual failures are logged, not fatal.
+#[cfg(target_os = "android")]
+pub fn add_system_routes(_cidrs: &[IpNet], _tun_name: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn add_system_routes(cidrs: &[IpNet], tun_name: &str) -> Result<(), String> {
+    if cidrs.is_empty() {
+        return Ok(());
+    }
+    let mut manager =
+        RouteManager::new().map_err(|e| format!("failed to create route manager: {}", e))?;
+    for cidr in cidrs {
+        let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
+            .with_if_name(tun_name.to_string());
+        match manager.add(&route) {
+            Ok(()) => tracing::info!("Installed route: {} via {}", cidr, tun_name),
+            Err(e) => tracing::warn!("Failed to install route {} via {}: {}", cidr, tun_name, e),
+        }
+    }
+    Ok(())
+}
+
+/// Remove a set of previously installed system routes.
+#[cfg(target_os = "android")]
+pub fn del_system_routes(_cidrs: &[IpNet], _tun_name: &str) {}
+
+#[cfg(not(target_os = "android"))]
+pub fn del_system_routes(cidrs: &[IpNet], tun_name: &str) {
+    if cidrs.is_empty() {
+        return;
+    }
+    let mut manager = match RouteManager::new() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Failed to create route manager for cleanup: {}", e);
+            return;
+        }
+    };
+    for cidr in cidrs {
+        let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
+            .with_if_name(tun_name.to_string());
+        if let Err(e) = manager.delete(&route) {
+            tracing::debug!("Failed to remove route {}: {}", cidr, e);
+        }
+    }
+}
+
 /// Sort routes: longest prefix first, then by address for ties.
 fn sort_routes(a: &Route, b: &Route) -> std::cmp::Ordering {
     let bits_a = a.prefix.prefix_len();

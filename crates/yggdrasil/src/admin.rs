@@ -161,7 +161,7 @@ async fn handle_admin_conn(stream: tokio::net::TcpStream, core: Arc<Core>) {
 async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_json::Value, String> {
     match req.request.to_lowercase().as_str() {
         "list" => Ok(serde_json::json!({
-            "list": ["list", "getself", "getpeers", "gettree", "getpaths", "getsessions", "gettun", "getmulticastinterfaces", "addpeer", "removepeer", "getdebug", "getlookup", "forcelookup", "getnodeinfo", "debug_remotegetself", "debug_remotegetpeers", "debug_remotegettree"],
+            "list": ["list", "getself", "getpeers", "gettree", "getpaths", "getsessions", "gettun", "getmulticastinterfaces", "addpeer", "removepeer", "addsubnet", "removesubnet", "getsubnets", "getdebug", "getlookup", "forcelookup", "getnodeinfo", "debug_remotegetself", "debug_remotegetpeers", "debug_remotegettree"],
         })),
 
         "getself" => {
@@ -249,6 +249,51 @@ async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_js
                 .await
                 .map_err(|e| format!("removePeer failed: {}", e))?;
             Ok(serde_json::json!({}))
+        }
+
+        #[cfg(feature = "ckr")]
+        "addsubnet" => {
+            let key = req
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'key' argument")?;
+            // Accept either `subnet=a` or `subnet=a,b,c` (comma-separated).
+            let subnets: Vec<String> = req
+                .arguments
+                .get("subnet")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'subnet' argument")?
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            core.ckr_add_subnet(key, subnets)
+                .map_err(|e| format!("addSubnet failed: {}", e))?;
+            Ok(serde_json::json!({}))
+        }
+
+        #[cfg(feature = "ckr")]
+        "removesubnet" => {
+            let key = req
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'key' argument")?;
+            core.ckr_remove_subnet(key)
+                .map_err(|e| format!("removeSubnet failed: {}", e))?;
+            Ok(serde_json::json!({}))
+        }
+
+        #[cfg(feature = "ckr")]
+        "getsubnets" => {
+            let subnets: Vec<serde_json::Value> = core
+                .ckr_list()
+                .map_err(|e| format!("getSubnets failed: {}", e))?
+                .into_iter()
+                .map(|(key, cidrs)| serde_json::json!({ "key": key, "subnets": cidrs }))
+                .collect();
+            Ok(serde_json::json!({ "subnets": subnets }))
         }
 
         "getpaths" => {

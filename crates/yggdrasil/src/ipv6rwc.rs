@@ -45,8 +45,24 @@ pub struct ReadWriteCloser {
     buffers: Mutex<KeyStoreBuffers>,
     mtu: u64,
     #[cfg(feature = "ckr")]
-    ckr: Option<CryptoKey>,
+    ckr: Option<CkrState>,
     firewall: Option<Arc<Firewall>>,
+}
+
+/// Runtime-mutable CKR state.
+///
+/// `table` is the compiled routing table read on every packet; it is swapped
+/// atomically (lock-free for readers, same pattern as `lookups`) whenever a
+/// subnet is added or removed. `config` is the authoritative source the table
+/// is rebuilt from, guarded by a plain mutex since writes are rare.
+#[cfg(feature = "ckr")]
+struct CkrState {
+    table: ArcSwap<CryptoKey>,
+    config: std::sync::Mutex<TunnelRoutingConfig>,
+    /// TUN interface name, set once the device is created (see
+    /// `set_ckr_tun_name`). Needed to install/remove system routes at runtime.
+    tun_name: std::sync::Mutex<Option<String>>,
+    self_key: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -72,14 +88,18 @@ impl ReadWriteCloser {
         let subnet = *core.subnet();
 
         #[cfg(feature = "ckr")]
-        let ckr = ckr_config
-            .filter(|c| c.enable)
-            .map(|c| {
-                CryptoKey::new(c, core.public_key()).unwrap_or_else(|e| {
-                    tracing::error!("Failed to configure CKR: {}", e);
-                    panic!("CKR configuration error: {}", e);
-                })
+        let ckr = ckr_config.filter(|c| c.enable).map(|c| {
+            let table = CryptoKey::new(c, core.public_key()).unwrap_or_else(|e| {
+                tracing::error!("Failed to configure CKR: {}", e);
+                panic!("CKR configuration error: {}", e);
             });
+            CkrState {
+                table: ArcSwap::from_pointee(table),
+                config: std::sync::Mutex::new(c.clone()),
+                tun_name: std::sync::Mutex::new(None),
+                self_key: *core.public_key(),
+            }
+        });
 
         Arc::new(Self {
             core,
@@ -160,8 +180,11 @@ impl ReadWriteCloser {
 
             // CKR path: dual-mode validation
             #[cfg(feature = "ckr")]
-            if let Some(ref ckr) = self.ckr {
-                let accepted = self.ckr_read_validate(ckr, packet, is_ip4, is_ip6, &from_key).await;
+            if let Some(state) = &self.ckr {
+                // load_full() yields an owned Arc (Send) that can be held across
+                // the awaits below; a borrowed arc_swap Guard could not.
+                let ckr = state.table.load_full();
+                let accepted = self.ckr_read_validate(&ckr, packet, is_ip4, is_ip6, &from_key).await;
                 if !accepted {
                     continue;
                 }
@@ -238,7 +261,7 @@ impl ReadWriteCloser {
 
         // CKR path: handle IPv4 and non-Yggdrasil IPv6 destinations
         #[cfg(feature = "ckr")]
-        if let Some(ref ckr) = self.ckr {
+        if let Some(state) = &self.ckr {
             let is_ip4 = buf.first().map_or(false, |b| b & 0xf0 == 0x40);
             if !is_ip4 && !is_ip6 {
                 return Ok(buf.len()); // silently drop non-IP
@@ -246,7 +269,8 @@ impl ReadWriteCloser {
             if is_ip6 && buf.len() < IPV6_HEADER_LEN {
                 return Ok(buf.len());
             }
-            return self.ckr_write(ckr, buf, is_ip4, is_ip6).await;
+            let ckr = state.table.load_full();
+            return self.ckr_write(&ckr, buf, is_ip4, is_ip6).await;
         }
 
         // Standard (non-CKR) path: IPv6 only
@@ -434,6 +458,111 @@ impl ReadWriteCloser {
     /// CKR inbound validation: check whether a received packet should be
     /// delivered to the TUN based on CKR routing rules.
     /// Returns true if the packet is accepted.
+    /// Record the TUN interface name so runtime subnet changes can install and
+    /// remove system routes. Called once after the TUN device is created.
+    #[cfg(feature = "ckr")]
+    pub fn set_ckr_tun_name(&self, name: &str) {
+        if let Some(state) = &self.ckr {
+            *state.tun_name.lock().unwrap() = Some(name.to_string());
+        }
+    }
+
+    /// Current CKR remote-subnet map (public key hex -> list of CIDRs).
+    #[cfg(feature = "ckr")]
+    pub fn ckr_list(&self) -> Vec<(String, Vec<String>)> {
+        match &self.ckr {
+            Some(state) => state
+                .config
+                .lock()
+                .unwrap()
+                .remote_subnets
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Add CKR subnets routed via `key_hex` at runtime, without a restart.
+    ///
+    /// The change is validated by rebuilding the routing table off a candidate
+    /// config; on success the new table is swapped in atomically and matching
+    /// system routes are installed. In-memory only — lost on restart.
+    #[cfg(feature = "ckr")]
+    pub fn ckr_add_subnet(&self, key_hex: &str, cidrs: Vec<String>) -> Result<(), String> {
+        let state = self.ckr.as_ref().ok_or("CKR is not enabled on this node")?;
+        if cidrs.is_empty() {
+            return Err("no subnets given".to_string());
+        }
+        let key_hex = key_hex.trim().to_lowercase();
+
+        let mut cfg = state.config.lock().unwrap();
+
+        // Merge into a candidate copy so a rejected change never mutates state.
+        let mut candidate = cfg.clone();
+        let entry = candidate.remote_subnets.entry(key_hex.clone()).or_default();
+        for c in &cidrs {
+            let c = c.trim().to_string();
+            if !entry.iter().any(|e| e == &c) {
+                entry.push(c);
+            }
+        }
+
+        // Validate: rebuild the table (checks key format, CIDRs, duplicates).
+        let new_table = CryptoKey::new(&candidate, &state.self_key)?;
+        // System routes implied by the newly requested CIDRs.
+        let new_cidrs = crate::ckr::routable_cidrs(&cidrs)?;
+        let install = candidate.install_system_routes;
+
+        // Commit.
+        *cfg = candidate;
+        state.table.store(Arc::new(new_table));
+        drop(cfg);
+
+        if install {
+            match state.tun_name.lock().unwrap().clone() {
+                Some(tun) => crate::ckr::add_system_routes(&new_cidrs, &tun)?,
+                None => tracing::warn!(
+                    "CKR: TUN name not set yet; skipped system route install for {}",
+                    key_hex
+                ),
+            }
+        }
+        tracing::info!("CKR: added {} subnet(s) via {}", cidrs.len(), key_hex);
+        Ok(())
+    }
+
+    /// Remove all CKR subnets routed via `key_hex` at runtime. In-memory only.
+    #[cfg(feature = "ckr")]
+    pub fn ckr_remove_subnet(&self, key_hex: &str) -> Result<(), String> {
+        let state = self.ckr.as_ref().ok_or("CKR is not enabled on this node")?;
+        let key_hex = key_hex.trim().to_lowercase();
+
+        let mut cfg = state.config.lock().unwrap();
+        let removed = match cfg.remote_subnets.get(&key_hex) {
+            Some(list) => list.clone(),
+            None => return Err(format!("no CKR subnets configured for key {}", key_hex)),
+        };
+
+        let mut candidate = cfg.clone();
+        candidate.remote_subnets.remove(&key_hex);
+        let new_table = CryptoKey::new(&candidate, &state.self_key)?;
+        let del_cidrs = crate::ckr::routable_cidrs(&removed).unwrap_or_default();
+        let install = candidate.install_system_routes;
+
+        *cfg = candidate;
+        state.table.store(Arc::new(new_table));
+        drop(cfg);
+
+        if install {
+            if let Some(tun) = state.tun_name.lock().unwrap().clone() {
+                crate::ckr::del_system_routes(&del_cidrs, &tun);
+            }
+        }
+        tracing::info!("CKR: removed CKR subnets for key {}", key_hex);
+        Ok(())
+    }
+
     #[cfg(feature = "ckr")]
     async fn ckr_read_validate(
         &self,
